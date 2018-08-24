@@ -289,6 +289,7 @@ class XapianSearchBackend(BaseSearchBackend):
         """
         database = self._database(writable=True)
 
+        # noinspection PyBroadException
         try:
             term_generator = xapian.TermGenerator()
             term_generator.set_database(database)
@@ -494,15 +495,12 @@ class XapianSearchBackend(BaseSearchBackend):
 
                 # finally, replace or add the document to the database
                 database.replace_document(document_id, document)
-        except xapian.InvalidArgumentError as exc:
-            if bool(re.match('^\s*Term\s+too\s+long\s+\(>\s*\d+\)', str(exc), re.I)):
-                sys.stderr.write("Term too long failure skipped.\n" 
-                                 "Details '{0!s}'\n".format(exc))
-            else:
-                raise
+        except xapian.InvalidArgumentError:
+            sys.stderr.write('Term too long failure skipped or Chunk failed.\n')
         except UnicodeDecodeError:
             sys.stderr.write('Chunk failed.\n')
-
+        except Exception:
+            sys.stderr.write('General failed.\n')
         finally:
             database.close()
 
