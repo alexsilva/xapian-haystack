@@ -35,10 +35,6 @@ elif sys.version_info[0] == 3:
     DirectoryExistsException = FileExistsError
 
 
-if sys.version_info.major == 2:  # compat py2.x
-    FileExistsError = OSError
-
-
 class NotSupportedError(Exception):
     """
     When the installed version of Xapian doesn't support something and we have
