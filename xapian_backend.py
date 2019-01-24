@@ -1,6 +1,7 @@
 from __future__ import unicode_literals
 
 import datetime
+import functools
 import pickle
 import os
 import re
@@ -159,6 +160,43 @@ class XHExpandDecider(xapian.ExpandDecider):
         return True
 
 
+class OpenConnections(object):
+    """Object that stores connections that should be closed"""
+    def __init__(self):
+        self.connections = []
+
+    def add(self, connection):
+        self.connections.append(connection)
+
+    def __iter__(self):
+        try:
+            yield self.connections.pop(0)
+        except IndexError:
+            pass
+        finally:
+            raise StopIteration
+
+    def close(self):
+        # keep_alive_on_finish: Lets you keep the connection in the list
+        # of active connections if it is necessary
+        for conn in self:
+            if not getattr(conn, "keep_alive_on_finish", False):
+                conn.close()
+
+
+def close_database(fn):
+    """Whenever an operation requires the opening of the database,
+        we will close the connection at the end of the execution"""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        # self: XapianSearchBackend
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            self.open_connections.close()
+    return wrapper
+
+
 class XapianSearchBackend(BaseSearchBackend):
     """
     `SearchBackend` defines the Xapian search backend for use with the Haystack
@@ -210,6 +248,9 @@ class XapianSearchBackend(BaseSearchBackend):
         stemming_strategy_string = getattr(settings, 'HAYSTACK_XAPIAN_STEMMING_STRATEGY', 'STEM_SOME')
         self.stemming_strategy = getattr(xapian.QueryParser, stemming_strategy_string, xapian.QueryParser.STEM_SOME)
 
+        # Any open connection will stay on this list in order to be closed later
+        self.open_connections = OpenConnections()
+
         # these 4 attributes are caches populated in `build_schema`
         # they are checked in `_update_cache`
         # use property to retrieve them
@@ -247,6 +288,7 @@ class XapianSearchBackend(BaseSearchBackend):
         self._update_cache()
         return self._columns
 
+    @close_database
     def update(self, index, iterable, commit=True):
         """
         Updates the `index` with any objects in `iterable` by adding/updating
@@ -504,6 +546,7 @@ class XapianSearchBackend(BaseSearchBackend):
         finally:
             database.close()
 
+    @close_database
     def remove(self, obj, commit=True):
         """
         Remove indexes for `obj` from the database.
@@ -518,6 +561,7 @@ class XapianSearchBackend(BaseSearchBackend):
         database.delete_document(TERM_PREFIXES[ID] + get_identifier(obj))
         database.close()
 
+    @close_database
     def clear(self, models=(), commit=True):
         """
         Clear all instances of `models` from the database or all models, if
@@ -545,6 +589,7 @@ class XapianSearchBackend(BaseSearchBackend):
                 database.delete_document(TERM_PREFIXES[DJANGO_CT] + get_model_ct(model))
             database.close()
 
+    @close_database
     def document_count(self):
         try:
             return self._database().get_doccount()
@@ -577,6 +622,7 @@ class XapianSearchBackend(BaseSearchBackend):
                 except KeyError:
                     raise InvalidIndexError('Trying to use non indexed field "%s"' % field_name)
 
+    @close_database
     @log_query
     def search(self, query, sort_by=None, start_offset=0, end_offset=None,
                fields='', highlight=False, facets=None, date_facets=None,
@@ -718,6 +764,7 @@ class XapianSearchBackend(BaseSearchBackend):
             'spelling_suggestion': spelling_suggestion,
         }
 
+    @close_database
     def more_like_this(self, model_instance, additional_query=None,
                        start_offset=0, end_offset=None,
                        limit_to_registered_models=True, result_class=None, **kwargs):
@@ -816,6 +863,7 @@ class XapianSearchBackend(BaseSearchBackend):
             'spelling_suggestion': None,
         }
 
+    @close_database
     def parse_query(self, query_string):
         """
         Given a `query_string`, will attempt to return a xapian.Query
@@ -1169,7 +1217,8 @@ class XapianSearchBackend(BaseSearchBackend):
                 database = xapian.Database(self.path)
             except xapian.DatabaseOpeningError:
                 raise InvalidIndexError('Unable to open index at %s' % self.path)
-
+        # Adds the connection to the closing list
+        self.open_connections.add(database)
         return database
 
     @staticmethod
