@@ -89,6 +89,8 @@ INTEGER_FORMAT = '%012d'
 # defines the distance given between
 # texts with positional information
 TERMPOS_DISTANCE = 100
+TERM_LENGTH_LIMIT = 200
+
 
 class InvalidIndexError(HaystackError):
     """Raised when an index can not be opened."""
@@ -375,11 +377,27 @@ class XapianSearchBackend(BaseSearchBackend):
 
                 The sentence is bounded by "^" "$" to allow exact matches.
                 """
+                def add_posting_word(value):
+                    term = '%s%s' % (prefix, value)
+                    document.add_posting(term, termpos, weight)
+
                 text = '^ %s $' % text
                 for word in text.split():
-                    term = '%s%s' % (prefix, word)
-                    document.add_posting(term, termpos, weight)
-                    termpos += 1
+                    # https://trac.xapian.org/wiki/FAQ/UniqueIds#Workingroundthetermlengthlimit
+                    # Working round the term length limit
+                    word = force_str(word)
+                    word_length = len(word)
+                    if word_length > TERM_LENGTH_LIMIT:
+                        start, step = 0, TERM_LENGTH_LIMIT
+                        while start < word_length:
+                            posting_word = word[start: step]
+                            add_posting_word(posting_word)
+                            termpos += 1
+                            start = step
+                            step += TERM_LENGTH_LIMIT
+                    else:
+                        add_posting_word(word)
+                        termpos += 1
                 termpos += TERMPOS_DISTANCE
                 return termpos
 
