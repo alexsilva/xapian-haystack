@@ -11,7 +11,7 @@ import sys
 from django.utils import six
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
-from django.utils.encoding import force_text
+from django.utils.encoding import force_text, force_str
 
 from haystack import connections
 from haystack.backends import BaseEngine, BaseSearchBackend, BaseSearchQuery, SearchNode, log_query
@@ -541,8 +541,9 @@ class XapianSearchBackend(BaseSearchBackend):
             sys.stderr.write('Term too long failure skipped or Chunk failed.\n')
         except UnicodeDecodeError:
             sys.stderr.write('Chunk failed.\n')
-        except Exception:
-            sys.stderr.write('General failed.\n')
+        except Exception as err:
+            sys.stderr.write('General failed: %s\n' %
+                             force_str(err, errors='ignore'))
         finally:
             database.close()
 
