@@ -385,7 +385,7 @@ class XapianSearchBackend(BaseSearchBackend):
                 for word in text.split():
                     # https://trac.xapian.org/wiki/FAQ/UniqueIds#Workingroundthetermlengthlimit
                     # Working round the term length limit
-                    word = force_str(word)
+                    word = force_str(word, errors="ignore")
                     word_length = len(word)
                     if word_length > TERM_LENGTH_LIMIT:
                         start, step = 0, TERM_LENGTH_LIMIT
