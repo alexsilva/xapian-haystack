@@ -726,8 +726,6 @@ class XapianSearchBackend(BaseSearchBackend):
             for spy in facets_spies:
                 enquire.add_matchspy(spy)
 
-        # print enquire.get_query()
-
         matches = self._get_enquire_mset(database, enquire, start_offset, end_offset)
 
         for match in matches:
