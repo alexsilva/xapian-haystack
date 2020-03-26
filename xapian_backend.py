@@ -170,13 +170,14 @@ class OpenConnections(object):
     def add(self, connection):
         self.connections.append(connection)
 
-    def __iter__(self):
+    def __next__(self):
         try:
-            yield self.connections.pop(0)
+            return self.connections.pop(0)
         except IndexError:
-            pass
-        finally:
             raise StopIteration
+
+    def __iter__(self):
+        return self
 
     def close(self):
         # keep_alive_on_finish: Lets you keep the connection in the list
