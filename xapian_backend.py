@@ -1384,7 +1384,7 @@ class XapianSearchQuery(BaseSearchQuery):
         # or others, thus we short-circuit the procedure.
         if isinstance(term, AutoQuery):
             if field_name != 'content':
-                query = '%s:%s' % (field_name, term.prepare(self))
+                query = '%s:"%s"' % (field_name, term.prepare(self))
             else:
                 query = term.prepare(self)
             return [self.backend.parse_query(query)]
