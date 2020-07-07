@@ -7,7 +7,7 @@ import os
 import re
 import shutil
 import sys
-
+import threading
 from django.utils import six
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
@@ -165,10 +165,23 @@ class XHExpandDecider(xapian.ExpandDecider):
 class OpenConnections(object):
     """Object that stores connections that should be closed"""
     def __init__(self):
+        self.lock = threading.Lock()
         self.connections = []
+        self.stack = 0
 
     def add(self, connection):
         self.connections.append(connection)
+
+    def stack_entry(self):
+        with self.lock:
+            self.stack += 1
+
+    def stack_exit(self):
+        with self.lock:
+            self.stack -= 1
+            if self.stack < 0:
+                self.stack = 0
+            return self.stack == 0
 
     def __next__(self):
         try:
@@ -194,9 +207,11 @@ def close_database(fn):
     def wrapper(self, *args, **kwargs):
         # self: XapianSearchBackend
         try:
+            self.open_connections.stack_entry()
             return fn(self, *args, **kwargs)
         finally:
-            self.open_connections.close()
+            if self.open_connections.stack_exit():
+                self.open_connections.close()
     return wrapper
 
 
