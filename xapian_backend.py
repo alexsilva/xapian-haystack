@@ -1161,9 +1161,11 @@ class XapianSearchBackend(BaseSearchBackend):
 
             for result in results:
                 result_date = getattr(result, date_facet)
-
+                # in this case result does not have a facet field
+                if result_date is None:
+                    continue
                 # convert date to datetime
-                if not isinstance(result_date, datetime.datetime):
+                elif not isinstance(result_date, datetime.datetime):
                     result_date = datetime.datetime(result_date.year,
                                                     result_date.month,
                                                     result_date.day)
