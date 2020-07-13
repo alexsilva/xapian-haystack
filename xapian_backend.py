@@ -754,11 +754,14 @@ class XapianSearchBackend(BaseSearchBackend):
         if not end_offset:
             end_offset = database.get_doccount() - start_offset
 
-        ## prepare spies in case of facets
+        # prepare spies in case of facets
         if facets:
             facets_spies = self._prepare_facet_field_spies(facets)
             for spy in facets_spies:
                 enquire.add_matchspy(spy)
+        else:
+            # context var
+            facets_spies = None
 
         matches = self._get_enquire_mset(database, enquire, start_offset, end_offset)
 
