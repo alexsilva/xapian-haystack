@@ -446,6 +446,21 @@ class XapianDocument:
         self.database.replace_document(document_id, document)
 
 
+class DatabaseTransaction:
+    """Context class that protects the database against corruption"""
+    def __init__(self, db):
+        self.db = db
+
+    def __enter__(self):
+        self.db.begin_transaction()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not (exc_type and exc_val and exc_tb):
+            self.db.commit_transaction()
+        else:
+            self.db.cancel_transaction()
+
+
 class XapianSearchBackend(BaseSearchBackend):
     """
     `SearchBackend` defines the Xapian search backend for use with the Haystack
@@ -586,14 +601,14 @@ class XapianSearchBackend(BaseSearchBackend):
         for obj in iterable:
             # noinspection PyBroadException
             try:
-                doc.update(obj)
+                with DatabaseTransaction(database):  # safe transaction
+                    doc.update(obj)
             except xapian.InvalidArgumentError:
                 sys.stderr.write('Term too long failure skipped or Chunk failed.\n')
             except UnicodeDecodeError:
                 sys.stderr.write('Chunk failed.\n')
             except Exception as err:
-                sys.stderr.write('General failed: %s\n' %
-                                 force_str(err, errors='ignore'))
+                sys.stderr.write('General failed: %s\n' % force_str(err, errors='ignore'))
 
     @close_database
     def remove(self, obj, commit=True):
