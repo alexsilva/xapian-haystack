@@ -2,17 +2,17 @@ from __future__ import unicode_literals
 
 import datetime
 import functools
-import pickle
 import os
+import pickle
 import re
 import shutil
 import sys
 import threading
-from django.utils import six
+
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
+from django.utils import six
 from django.utils.encoding import force_text, force_str
-
 from haystack import connections
 from haystack.backends import BaseEngine, BaseSearchBackend, BaseSearchQuery, SearchNode, log_query
 from haystack.constants import ID, DJANGO_ID, DJANGO_CT, DEFAULT_OPERATOR
@@ -42,6 +42,7 @@ class NotSupportedError(Exception):
     the old implementation.
     """
     pass
+
 
 # this maps the different reserved fields to prefixes used to
 # create the database:
@@ -215,6 +216,237 @@ def close_database(fn):
     return wrapper
 
 
+class XapianDocument:
+    document = None
+
+    def __init__(self, index, schema, database, **options):
+        self.database = database
+        self.options = options
+        self.schema = schema
+        self.index = index
+
+        self.term_generator = xapian.TermGenerator()
+        self.term_generator.set_database(self.database)
+        self.term_generator.set_stemmer(xapian.Stem(self.options['language']))
+        try:
+            self.term_generator.set_stemming_strategy(self.options['stemming_strategy'])
+        except AttributeError:
+            # Versions before Xapian 1.2.11 do not support stemming strategies for TermGenerator
+            pass
+        if self.options['include_spelling'] is True:
+            self.term_generator.set_flags(xapian.TermGenerator.FLAG_SPELLING)
+
+    def _add_text(self, termpos, text, weight, prefix=''):
+        """
+        indexes text appending 2 extra terms
+        to identify beginning and ending of the text.
+        """
+        self.term_generator.set_termpos(termpos)
+
+        start_term = '%s^' % prefix
+        end_term = '%s$' % prefix
+        # add begin
+        self.document.add_posting(start_term, termpos, weight)
+        # add text
+        self.term_generator.index_text(text, weight, prefix)
+        termpos = self.term_generator.get_termpos()
+        # add ending
+        termpos += 1
+        self.document.add_posting(end_term, termpos, weight)
+
+        # increase termpos
+        self.term_generator.set_termpos(termpos)
+        self.term_generator.increase_termpos(TERMPOS_DISTANCE)
+
+        return self.term_generator.get_termpos()
+
+    def _add_literal_text(self, termpos, text, weight, prefix=''):
+        """
+        Adds sentence to the document with positional information
+        but without processing.
+
+        The sentence is bounded by "^" "$" to allow exact matches.
+        """
+
+        def add_posting_word(value):
+            term = '%s%s' % (prefix, value)
+            self.document.add_posting(term, termpos, weight)
+
+        text = '^ %s $' % text
+        for word in text.split():
+            # https://trac.xapian.org/wiki/FAQ/UniqueIds#Workingroundthetermlengthlimit
+            # Working round the term length limit
+            word = force_str(word, errors="ignore")
+            word_length = len(word)
+            if word_length > TERM_LENGTH_LIMIT:
+                start, step = 0, TERM_LENGTH_LIMIT
+                while start < word_length:
+                    posting_word = word[start: step]
+                    add_posting_word(posting_word)
+                    termpos += 1
+                    start = step
+                    step += TERM_LENGTH_LIMIT
+            else:
+                add_posting_word(word)
+                termpos += 1
+        termpos += TERMPOS_DISTANCE
+        return termpos
+
+    def add_text(self, termpos, prefix, text, weight):
+        """
+        Adds text to the document with positional information
+        and processing (e.g. stemming).
+        """
+        termpos = self._add_text(termpos, text, weight, prefix=prefix)
+        termpos = self._add_text(termpos, text, weight, prefix='')
+        termpos = self._add_literal_text(termpos, text, weight, prefix=prefix)
+        termpos = self._add_literal_text(termpos, text, weight, prefix='')
+        return termpos
+
+    def _get_ngram_lengths(self, value):
+        values = value.split()
+        for item in values:
+            for ngram_length in six.moves.range(NGRAM_MIN_LENGTH, NGRAM_MAX_LENGTH + 1):
+                yield item, ngram_length
+
+    def ngram_terms(self, value):
+        for item, length in self._get_ngram_lengths(value):
+            item_length = len(item)
+            for start in six.moves.range(0, item_length - length + 1):
+                for size in six.moves.range(length, length + 1):
+                    end = start + size
+                    if end > item_length:
+                        continue
+                    yield _to_xapian_term(item[start:end])
+
+    def edge_ngram_terms(self, value):
+        for item, length in self._get_ngram_lengths(value):
+            yield _to_xapian_term(item[0:length])
+
+    def add_edge_ngram_to_document(self, prefix, value, weight):
+        """
+        Splits the term in ngrams and adds each ngram to the index.
+        The minimum and maximum size of the ngram is respectively
+        NGRAM_MIN_LENGTH and NGRAM_MAX_LENGTH.
+        """
+        for term in self.edge_ngram_terms(value):
+            self.document.add_term(term, weight)
+            self.document.add_term(prefix + term, weight)
+
+    def add_ngram_to_document(self, prefix, value, weight):
+        """
+        Splits the term in ngrams and adds each ngram to the index.
+        The minimum and maximum size of the ngram is respectively
+        NGRAM_MIN_LENGTH and NGRAM_MAX_LENGTH.
+        """
+        for term in self.ngram_terms(value):
+            self.document.add_term(term, weight)
+            self.document.add_term(prefix + term, weight)
+
+    def add_non_text_to_document(self, prefix, term, weight):
+        """
+        Adds term to the document without positional information
+        and without processing.
+
+        If the term is alone, also adds it as "^<term>$"
+        to allow exact matches on single terms.
+        """
+        self.document.add_term(term, weight)
+        self.document.add_term(prefix + term, weight)
+
+    def add_datetime_to_document(self, termpos, prefix, term, weight):
+        """
+        Adds a datetime to document with positional order
+        to allow exact matches on it.
+        """
+        date, time = term.split()
+        self.document.add_posting(date, termpos, weight)
+        termpos += 1
+        self.document.add_posting(time, termpos, weight)
+        termpos += 1
+        self.document.add_posting(prefix + date, termpos, weight)
+        termpos += 1
+        self.document.add_posting(prefix + time, termpos, weight)
+        termpos += TERMPOS_DISTANCE + 1
+        return termpos
+
+    def update(self, obj):
+        self.document = document = xapian.Document()
+        self.term_generator.set_document(document)
+        data = self.index.full_prepare(obj)
+        weights = self.index.get_field_weights()
+
+        termpos = self.term_generator.get_termpos()  # identifies the current position in the document.
+        for field in self.schema:
+            if field['field_name'] not in list(data.keys()):
+                # not supported fields are ignored.
+                continue
+
+            if field['field_name'] in weights:
+                weight = int(weights[field['field_name']])
+            else:
+                weight = 1
+
+            value = data[field['field_name']]
+
+            if field['field_name'] in (ID, DJANGO_ID, DJANGO_CT):
+                # Private fields are indexed in a different way:
+                # `django_id` is an int and `django_ct` is text;
+                # besides, they are indexed by their (unstemmed) value.
+                if field['field_name'] == DJANGO_ID:
+                    value = int(value)
+                value = _term_to_xapian_value(value, field['type'])
+
+                document.add_term(TERM_PREFIXES[field['field_name']] + value, weight)
+                document.add_value(field['column'], value)
+                continue
+            else:
+                prefix = TERM_PREFIXES['field'] + field['field_name'].upper()
+
+                # if not multi_valued, we add as a document value
+                # for sorting and facets
+                if field['multi_valued'] == 'false':
+                    document.add_value(field['column'], _term_to_xapian_value(value, field['type']))
+                else:
+                    for t in value:
+                        # add the exact match of each value
+                        term = _to_xapian_term(t)
+                        termpos = self.add_text(termpos, prefix, term, weight)
+                    continue
+
+                term = _to_xapian_term(value)
+                if term == '':
+                    continue
+                # from here on the term is a string;
+                # we now decide how it is indexed
+
+                if field['type'] == 'text':
+                    # text is indexed with positional information
+                    termpos = self.add_text(termpos, prefix, term, weight)
+                elif field['type'] == 'datetime':
+                    termpos = self.add_datetime_to_document(termpos, prefix, term, weight)
+                elif field['type'] == 'ngram':
+                    self.add_ngram_to_document(prefix, value, weight)
+                elif field['type'] == 'edge_ngram':
+                    self.add_edge_ngram_to_document(prefix, value, weight)
+                else:
+                    # all other terms are added without positional information
+                    self.add_non_text_to_document(prefix, term, weight)
+
+        # store data without indexing it
+        document.set_data(pickle.dumps(
+            (obj._meta.app_label, obj._meta.model_name, obj.pk, data),
+            pickle.HIGHEST_PROTOCOL
+        ))
+
+        # add the id of the document
+        document_id = TERM_PREFIXES[ID] + get_identifier(obj)
+        document.add_term(document_id)
+
+        # finally, replace or add the document to the database
+        self.database.replace_document(document_id, document)
+
+
 class XapianSearchBackend(BaseSearchBackend):
     """
     `SearchBackend` defines the Xapian search backend for use with the Haystack
@@ -348,238 +580,21 @@ class XapianSearchBackend(BaseSearchBackend):
         through the use of the :method:xapian.sortable_serialise method.
         """
         database = self._database(writable=True)
-
-        # noinspection PyBroadException
-        try:
-            term_generator = xapian.TermGenerator()
-            term_generator.set_database(database)
-            term_generator.set_stemmer(xapian.Stem(self.language))
+        doc = XapianDocument(index, self.schema, database,
+                             stemming_strategy=self.stemming_strategy,
+                             include_spelling=self.include_spelling,
+                             language=self.language)
+        for obj in iterable:
+            # noinspection PyBroadException
             try:
-                term_generator.set_stemming_strategy(self.stemming_strategy)
-            except AttributeError:  
-                # Versions before Xapian 1.2.11 do not support stemming strategies for TermGenerator
-                pass
-            if self.include_spelling is True:
-                term_generator.set_flags(xapian.TermGenerator.FLAG_SPELLING)
-
-            def _add_text(termpos, text, weight, prefix=''):
-                """
-                indexes text appending 2 extra terms
-                to identify beginning and ending of the text.
-                """
-                term_generator.set_termpos(termpos)
-
-                start_term = '%s^' % prefix
-                end_term = '%s$' % prefix
-                # add begin
-                document.add_posting(start_term, termpos, weight)
-                # add text
-                term_generator.index_text(text, weight, prefix)
-                termpos = term_generator.get_termpos()
-                # add ending
-                termpos += 1
-                document.add_posting(end_term, termpos, weight)
-
-                # increase termpos
-                term_generator.set_termpos(termpos)
-                term_generator.increase_termpos(TERMPOS_DISTANCE)
-
-                return term_generator.get_termpos()
-
-            def _add_literal_text(termpos, text, weight, prefix=''):
-                """
-                Adds sentence to the document with positional information
-                but without processing.
-
-                The sentence is bounded by "^" "$" to allow exact matches.
-                """
-                def add_posting_word(value):
-                    term = '%s%s' % (prefix, value)
-                    document.add_posting(term, termpos, weight)
-
-                text = '^ %s $' % text
-                for word in text.split():
-                    # https://trac.xapian.org/wiki/FAQ/UniqueIds#Workingroundthetermlengthlimit
-                    # Working round the term length limit
-                    word = force_str(word, errors="ignore")
-                    word_length = len(word)
-                    if word_length > TERM_LENGTH_LIMIT:
-                        start, step = 0, TERM_LENGTH_LIMIT
-                        while start < word_length:
-                            posting_word = word[start: step]
-                            add_posting_word(posting_word)
-                            termpos += 1
-                            start = step
-                            step += TERM_LENGTH_LIMIT
-                    else:
-                        add_posting_word(word)
-                        termpos += 1
-                termpos += TERMPOS_DISTANCE
-                return termpos
-
-            def add_text(termpos, prefix, text, weight):
-                """
-                Adds text to the document with positional information
-                and processing (e.g. stemming).
-                """
-                termpos = _add_text(termpos, text, weight, prefix=prefix)
-                termpos = _add_text(termpos, text, weight, prefix='')
-                termpos = _add_literal_text(termpos, text, weight, prefix=prefix)
-                termpos = _add_literal_text(termpos, text, weight, prefix='')
-                return termpos
-
-            def _get_ngram_lengths(value):
-                values = value.split()
-                for item in values:
-                    for ngram_length in six.moves.range(NGRAM_MIN_LENGTH, NGRAM_MAX_LENGTH + 1):
-                        yield item, ngram_length
-
-            for obj in iterable:
-                document = xapian.Document()
-                term_generator.set_document(document)
-
-                def ngram_terms(value):
-                    for item, length in _get_ngram_lengths(value):
-                        item_length = len(item)
-                        for start in six.moves.range(0, item_length - length + 1):
-                            for size in six.moves.range(length, length + 1):
-                                end = start + size
-                                if end > item_length:
-                                    continue
-                                yield _to_xapian_term(item[start:end])
-
-                def edge_ngram_terms(value):
-                    for item, length in _get_ngram_lengths(value):
-                        yield _to_xapian_term(item[0:length])
-
-                def add_edge_ngram_to_document(prefix, value, weight):
-                    """
-                    Splits the term in ngrams and adds each ngram to the index.
-                    The minimum and maximum size of the ngram is respectively
-                    NGRAM_MIN_LENGTH and NGRAM_MAX_LENGTH.
-                    """
-                    for term in edge_ngram_terms(value):
-                        document.add_term(term, weight)
-                        document.add_term(prefix + term, weight)
-
-                def add_ngram_to_document(prefix, value, weight):
-                    """
-                    Splits the term in ngrams and adds each ngram to the index.
-                    The minimum and maximum size of the ngram is respectively
-                    NGRAM_MIN_LENGTH and NGRAM_MAX_LENGTH.
-                    """
-                    for term in ngram_terms(value):
-                        document.add_term(term, weight)
-                        document.add_term(prefix + term, weight)
-
-                def add_non_text_to_document(prefix, term, weight):
-                    """
-                    Adds term to the document without positional information
-                    and without processing.
-
-                    If the term is alone, also adds it as "^<term>$"
-                    to allow exact matches on single terms.
-                    """
-                    document.add_term(term, weight)
-                    document.add_term(prefix + term, weight)
-
-                def add_datetime_to_document(termpos, prefix, term, weight):
-                    """
-                    Adds a datetime to document with positional order
-                    to allow exact matches on it.
-                    """
-                    date, time = term.split()
-                    document.add_posting(date, termpos, weight)
-                    termpos += 1
-                    document.add_posting(time, termpos, weight)
-                    termpos += 1
-                    document.add_posting(prefix + date, termpos, weight)
-                    termpos += 1
-                    document.add_posting(prefix + time, termpos, weight)
-                    termpos += TERMPOS_DISTANCE + 1
-                    return termpos
-
-                data = index.full_prepare(obj)
-                weights = index.get_field_weights()
-
-                termpos = term_generator.get_termpos()  # identifies the current position in the document.
-                for field in self.schema:
-                    if field['field_name'] not in list(data.keys()):
-                        # not supported fields are ignored.
-                        continue
-
-                    if field['field_name'] in weights:
-                        weight = int(weights[field['field_name']])
-                    else:
-                        weight = 1
-
-                    value = data[field['field_name']]
-
-                    if field['field_name'] in (ID, DJANGO_ID, DJANGO_CT):
-                        # Private fields are indexed in a different way:
-                        # `django_id` is an int and `django_ct` is text;
-                        # besides, they are indexed by their (unstemmed) value.
-                        if field['field_name'] == DJANGO_ID:
-                            value = int(value)
-                        value = _term_to_xapian_value(value, field['type'])
-
-                        document.add_term(TERM_PREFIXES[field['field_name']] + value, weight)
-                        document.add_value(field['column'], value)
-                        continue
-                    else:
-                        prefix = TERM_PREFIXES['field'] + field['field_name'].upper()
-
-                        # if not multi_valued, we add as a document value
-                        # for sorting and facets
-                        if field['multi_valued'] == 'false':
-                            document.add_value(field['column'], _term_to_xapian_value(value, field['type']))
-                        else:
-                            for t in value:
-                                # add the exact match of each value
-                                term = _to_xapian_term(t)
-                                termpos = add_text(termpos, prefix, term, weight)
-                            continue
-
-                        term = _to_xapian_term(value)
-                        if term == '':
-                            continue
-                        # from here on the term is a string;
-                        # we now decide how it is indexed
-
-                        if field['type'] == 'text':
-                            # text is indexed with positional information
-                            termpos = add_text(termpos, prefix, term, weight)
-                        elif field['type'] == 'datetime':
-                            termpos = add_datetime_to_document(termpos, prefix, term, weight)
-                        elif field['type'] == 'ngram':
-                            add_ngram_to_document(prefix, value, weight)
-                        elif field['type'] == 'edge_ngram':
-                            add_edge_ngram_to_document(prefix, value, weight)
-                        else:
-                            # all other terms are added without positional information
-                            add_non_text_to_document(prefix, term, weight)
-
-                # store data without indexing it
-                document.set_data(pickle.dumps(
-                    (obj._meta.app_label, obj._meta.model_name, obj.pk, data),
-                    pickle.HIGHEST_PROTOCOL
-                ))
-
-                # add the id of the document
-                document_id = TERM_PREFIXES[ID] + get_identifier(obj)
-                document.add_term(document_id)
-
-                # finally, replace or add the document to the database
-                database.replace_document(document_id, document)
-        except xapian.InvalidArgumentError:
-            sys.stderr.write('Term too long failure skipped or Chunk failed.\n')
-        except UnicodeDecodeError:
-            sys.stderr.write('Chunk failed.\n')
-        except Exception as err:
-            sys.stderr.write('General failed: %s\n' %
-                             force_str(err, errors='ignore'))
-        finally:
-            database.close()
+                doc.update(obj)
+            except xapian.InvalidArgumentError:
+                sys.stderr.write('Term too long failure skipped or Chunk failed.\n')
+            except UnicodeDecodeError:
+                sys.stderr.write('Chunk failed.\n')
+            except Exception as err:
+                sys.stderr.write('General failed: %s\n' %
+                                 force_str(err, errors='ignore'))
 
     @close_database
     def remove(self, obj, commit=True):
