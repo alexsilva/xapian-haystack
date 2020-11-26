@@ -10,7 +10,7 @@ def read(fname):
 
 setup(
     name='xapian-haystack',
-    version='2.1.3',
+    version='2.1.5',
     description='A Xapian backend for Haystack',
     long_description=read('README.rst'),
     classifiers=[
