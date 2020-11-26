@@ -260,6 +260,10 @@ class XapianDocument:
 
         return self.term_generator.get_termpos()
 
+    def _add_posting_word(self, value, prefix,  termpos, weight):
+        term = '%s%s' % (prefix, value)
+        self.document.add_posting(term, termpos, weight)
+
     def _add_literal_text(self, termpos, text, weight, prefix=''):
         """
         Adds sentence to the document with positional information
@@ -267,11 +271,6 @@ class XapianDocument:
 
         The sentence is bounded by "^" "$" to allow exact matches.
         """
-
-        def add_posting_word(value):
-            term = '%s%s' % (prefix, value)
-            self.document.add_posting(term, termpos, weight)
-
         text = '^ %s $' % text
         for word in text.split():
             # https://trac.xapian.org/wiki/FAQ/UniqueIds#Workingroundthetermlengthlimit
@@ -282,12 +281,12 @@ class XapianDocument:
                 start, step = 0, TERM_LENGTH_LIMIT
                 while start < word_length:
                     posting_word = word[start: step]
-                    add_posting_word(posting_word)
+                    self._add_posting_word(posting_word, prefix, termpos, weight)
                     termpos += 1
                     start = step
                     step += TERM_LENGTH_LIMIT
             else:
-                add_posting_word(word)
+                self._add_posting_word(word, prefix, termpos, weight)
                 termpos += 1
         termpos += TERMPOS_DISTANCE
         return termpos
